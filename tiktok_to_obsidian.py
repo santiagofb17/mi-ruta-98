@@ -1,73 +1,70 @@
 #!/usr/bin/env python3
-"""Extrae una cuenta pública de TikTok vía Apify y genera notas Markdown para Obsidian.
+"""Archiva una cuenta pública de TikTok en Obsidian usando yt-dlp (gratis, sin API).
 
 Genera, dentro de tu vault:
     TikTok - @handle/
-        @handle - perfil.md        (índice: videos en orden del perfil + playlists)
-        Videos/<video>.md          (videos sin playlist, en orden del perfil)
-        Playlists/<playlist>/<video>.md
-        _raw.json                  (respuesta cruda de Apify, para verificar/afinar)
+        @handle - perfil.md            (índice: videos en orden + playlists)
+        Videos/<video>.md              (videos del perfil, del más nuevo al más viejo)
+        Playlists/<playlist>/<video>.md (solo si pasas --playlist "Nombre=URL")
 
-Cada nota de video incluye métricas, descripción, hashtags y el TRANSCRIPT ordenado.
+Cada nota incluye métricas, descripción, hashtags y el TRANSCRIPT ordenado
+(cuando el video tiene subtítulos disponibles).
+
+Requisitos:
+    - Python 3.9+
+    - yt-dlp instalado:  python3 -m pip install -U yt-dlp
 
 Uso:
-    export APIFY_TOKEN="tu_token"
-    python3 tiktok_to_obsidian.py <handle> -o /ruta/a/tu/vault [--limit 50]
+    python3 tiktok_to_obsidian.py @ernietheplutus -o "/ruta/a/tu/Vault" --limit 50
+
+Con playlists separadas (copia las URLs desde la pestaña "Playlists" del perfil):
+    python3 tiktok_to_obsidian.py @ernietheplutus -o "/ruta/a/tu/Vault" \
+        --playlist "Recetas=https://www.tiktok.com/@ernietheplutus/playlist/Recetas-1234" \
+        --playlist "Tips=https://www.tiktok.com/@ernietheplutus/playlist/Tips-5678"
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
-import urllib.error
-import urllib.request
+import tempfile
 from datetime import datetime, timezone
 
-APIFY_ACTOR = "clockworks~tiktok-scraper"
-APIFY_URL = (
-    "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items?token={token}"
-)
+
+def ensure_ytdlp(ytdlp):
+    if shutil.which(ytdlp) is None:
+        sys.exit(
+            f"No encuentro '{ytdlp}'. Instálalo con:\n"
+            f"    python3 -m pip install -U yt-dlp"
+        )
 
 
-def http_post_json(url, payload, timeout=600):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def fetch_from_apify(handle, token, limit, actor):
-    payload = {
-        "profiles": [handle],
-        "resultsPerPage": limit,
-        "profileSorting": "latest",
-        "shouldDownloadSubtitles": True,
-        "shouldDownloadVideos": False,
-        "shouldDownloadCovers": False,
-        "shouldDownloadSlideshowImages": False,
-    }
-    url = APIFY_URL.format(actor=actor, token=token)
-    try:
-        return http_post_json(url, payload)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        sys.exit(f"Error HTTP {e.code} de Apify: {body}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Error de red al contactar Apify: {e.reason}")
+def run_ytdlp(ytdlp, url, limit, tmpdir):
+    """Descarga metadatos + subtítulos (sin el video) a tmpdir."""
+    cmd = [
+        ytdlp,
+        url,
+        "--skip-download",
+        "--write-info-json",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", "all",
+        "--sub-format", "vtt/srt/best",
+        "--ignore-errors",
+        "--no-warnings",
+        "--no-write-playlist-metafiles",
+        "-I", f"1:{limit}",
+        "-o", os.path.join(tmpdir, "%(id)s.%(ext)s"),
+    ]
+    print(f"  yt-dlp → {url}")
+    subprocess.run(cmd, check=False)
 
 
 # ----------------------------- helpers ------------------------------------ #
-
-def first(d, *keys, default=None):
-    """Devuelve el primer valor no vacío entre varias claves posibles."""
-    for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, "", [], {}):
-            return d[k]
-    return default
-
 
 def slugify(value):
     value = re.sub(r"[^\w\s-]", "", str(value), flags=re.UNICODE).strip().lower()
@@ -81,141 +78,103 @@ def yaml_escape(value):
     return f'"{s}"'
 
 
-def author_from_items(items):
-    for it in items:
-        meta = it.get("authorMeta") or it.get("author")
-        if isinstance(meta, dict) and meta:
-            return meta
-    return {}
+def load_videos(tmpdir):
+    """Carga los *.info.json (un objeto por video), ignorando metafiles de playlist."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(tmpdir, "*.info.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                info = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(info, dict) or info.get("_type") == "playlist":
+            continue
+        if not info.get("id"):
+            continue
+        out.append(info)
+    return out
 
 
-def video_title(it):
-    text = (it.get("text") or it.get("desc") or "").strip().replace("\n", " ")
+def video_title(info):
+    text = (info.get("description") or info.get("title") or "").strip().replace("\n", " ")
     if text:
         return text[:80]
-    return f"video-{it.get('id', 'sin-id')}"
+    return f"video-{info.get('id', 'sin-id')}"
 
 
-def playlist_name(it):
-    """Detecta el nombre de la playlist de un video con varias claves posibles."""
-    pl = first(it, "playlistName", "playListName", "collectionName")
-    if pl:
-        return str(pl)
-    nested = it.get("playlist") or it.get("playList") or it.get("collection")
-    if isinstance(nested, dict):
-        return str(first(nested, "name", "title", default="")) or None
-    return None
+def video_ts(info):
+    ts = info.get("timestamp")
+    return ts if isinstance(ts, (int, float)) else 0
 
 
-def is_pinned(it):
-    return bool(first(it, "isPinned", "pinned", default=False))
-
-
-def create_ts(it):
-    """Timestamp numérico para ordenar (mayor = más reciente)."""
-    ts = it.get("createTime")
-    if isinstance(ts, (int, float)):
-        return ts
-    iso = it.get("createTimeISO")
-    if iso:
-        try:
-            return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            pass
-    return 0
-
-
-def profile_order(items):
-    """Orden del perfil: fijados primero, luego del más reciente al más antiguo."""
-    return sorted(items, key=lambda it: (not is_pinned(it), -create_ts(it)))
+def hashtags_from(info):
+    tags = info.get("tags")
+    if isinstance(tags, list) and tags:
+        return [str(t) for t in tags]
+    desc = info.get("description") or ""
+    return re.findall(r"#(\w+)", desc)
 
 
 # --------------------------- transcripts ----------------------------------- #
 
-def subtitle_links(it):
-    vmeta = it.get("videoMeta") or {}
-    links = first(vmeta, "subtitleLinks", default=None) or first(
-        it, "subtitleLinks", default=None
-    )
-    return links if isinstance(links, list) else []
-
-
 def parse_vtt_or_srt(text):
-    """Convierte WebVTT/SRT en texto plano ordenado, sin duplicados consecutivos."""
     out = []
     for raw in text.splitlines():
         line = raw.strip()
-        if not line:
+        if not line or line.upper().startswith("WEBVTT"):
             continue
-        if line.upper().startswith("WEBVTT"):
+        if "-->" in line or re.fullmatch(r"\d+", line):
             continue
-        if "-->" in line:
+        if line.upper().startswith(("NOTE", "STYLE", "REGION", "KIND:", "LANGUAGE:")):
             continue
-        if re.fullmatch(r"\d+", line):  # índice de cue (SRT)
-            continue
-        if line.upper().startswith(("NOTE", "STYLE", "REGION")):
-            continue
-        clean = re.sub(r"<[^>]+>", "", line).strip()  # tags <c>, <00:00:00.000>
+        clean = re.sub(r"<[^>]+>", "", line).strip()
+        clean = re.sub(r"&nbsp;?", " ", clean)
         if clean and (not out or out[-1] != clean):
             out.append(clean)
     return "\n".join(out)
 
 
-def fetch_transcript(it):
-    links = subtitle_links(it)
-    if not links:
-        return None, None
-    # Prioriza inglés/original; si no, toma el primero.
-    def lang_of(l):
-        return str(first(l, "language", "languageCodeName", "source", default="")).lower()
-
-    links_sorted = sorted(
-        links, key=lambda l: (0 if lang_of(l).startswith("en") else 1)
+def find_transcript(tmpdir, video_id):
+    """Busca un archivo de subtítulos para el video y lo parsea. Prioriza inglés."""
+    candidates = glob.glob(os.path.join(tmpdir, f"{video_id}.*.vtt")) + glob.glob(
+        os.path.join(tmpdir, f"{video_id}.*.srt")
     )
-    for link in links_sorted:
-        url = first(link, "downloadLink", "link", "url")
-        if not url:
-            continue
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda p: (0 if ".en" in os.path.basename(p).lower() else 1))
+    for path in candidates:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                raw = resp.read().decode("utf-8", "replace")
-            transcript = parse_vtt_or_srt(raw)
-            if transcript:
-                return transcript, lang_of(link) or "desconocido"
-        except Exception:
+            with open(path, encoding="utf-8") as f:
+                text = parse_vtt_or_srt(f.read())
+        except OSError:
             continue
+        if text:
+            lang = os.path.basename(path).split(".")[-2]
+            return text, lang
     return None, None
 
 
 # ----------------------------- writers ------------------------------------- #
 
-def write_video_note(path, handle_name, it, group_label):
-    title = video_title(it)
-    vmeta = it.get("videoMeta") or {}
-    music = it.get("musicMeta") or {}
-    hashtags = [
-        h.get("name")
-        for h in (it.get("hashtags") or [])
-        if isinstance(h, dict) and h.get("name")
-    ]
-    transcript, tlang = fetch_transcript(it)
-
+def write_video_note(path, handle, info, group_label, tmpdir):
+    title = video_title(info)
+    hashtags = hashtags_from(info)
+    transcript, tlang = find_transcript(tmpdir, info.get("id"))
     fm = {
         "tipo": "tiktok-video",
-        "cuenta": f"@{handle_name}",
+        "cuenta": f"@{handle}",
         "playlist": group_label,
-        "id": it.get("id"),
-        "fecha": it.get("createTimeISO") or it.get("createTime"),
-        "fijado": is_pinned(it),
-        "vistas": it.get("playCount"),
-        "likes": it.get("diggCount"),
-        "comentarios": it.get("commentCount"),
-        "compartidos": it.get("shareCount"),
-        "guardados": it.get("collectCount"),
-        "duracion_seg": vmeta.get("duration"),
+        "id": info.get("id"),
+        "fecha": datetime.fromtimestamp(video_ts(info), timezone.utc).strftime("%Y-%m-%d")
+        if video_ts(info)
+        else info.get("upload_date"),
+        "vistas": info.get("view_count"),
+        "likes": info.get("like_count"),
+        "comentarios": info.get("comment_count"),
+        "compartidos": info.get("repost_count"),
+        "duracion_seg": info.get("duration"),
         "transcript_idioma": tlang,
-        "url": it.get("webVideoUrl"),
+        "url": info.get("webpage_url"),
     }
     lines = ["---"]
     for k, v in fm.items():
@@ -224,12 +183,12 @@ def write_video_note(path, handle_name, it, group_label):
     lines.append(f"tags: [{tag_list}]")
     lines.append("---\n")
     lines.append(f"# {title}\n")
-    lines.append(f"Cuenta: [[@{handle_name} - perfil|@{handle_name}]] · Playlist: {group_label}\n")
+    lines.append(f"Cuenta: [[@{handle} - perfil|@{handle}]] · Playlist: {group_label}\n")
 
-    full_text = (it.get("text") or it.get("desc") or "").strip()
-    if full_text:
+    desc = (info.get("description") or "").strip()
+    if desc:
         lines.append("## Descripción\n")
-        lines.append(full_text + "\n")
+        lines.append(desc + "\n")
 
     lines.append("## Métricas\n")
     lines.append("| Métrica | Valor |")
@@ -238,22 +197,15 @@ def write_video_note(path, handle_name, it, group_label):
     lines.append(f"| Likes | {fm['likes']} |")
     lines.append(f"| Comentarios | {fm['comentarios']} |")
     lines.append(f"| Compartidos | {fm['compartidos']} |")
-    lines.append(f"| Guardados | {fm['guardados']} |")
     lines.append(f"| Duración (seg) | {fm['duracion_seg']} |\n")
 
     lines.append("## Transcript\n")
-    if transcript:
-        lines.append(transcript + "\n")
-    else:
-        lines.append("_(Sin subtítulos/transcript disponible para este video.)_\n")
+    lines.append((transcript + "\n") if transcript else
+                 "_(Sin subtítulos/transcript disponible para este video.)_\n")
 
     if hashtags:
         lines.append("## Hashtags\n")
         lines.append(" ".join(f"#{h}" for h in hashtags) + "\n")
-
-    if music.get("musicName"):
-        lines.append("## Audio\n")
-        lines.append(f"{music.get('musicName')} — {music.get('musicAuthor', '')}\n")
 
     if fm["url"]:
         lines.append(f"[Ver en TikTok]({fm['url']})\n")
@@ -262,19 +214,16 @@ def write_video_note(path, handle_name, it, group_label):
         f.write("\n".join(lines))
 
 
-def write_profile_note(out_dir, handle, author, ordered, groups):
-    name = author.get("name") or author.get("uniqueId") or handle
-    nick = author.get("nickName") or author.get("nickname") or name
+def write_profile_note(base, handle, sample, profile_videos, playlists):
+    follower = sample.get("channel_follower_count") if sample else None
+    nick = (sample.get("uploader") or sample.get("channel") or handle) if sample else handle
     fm = {
         "tipo": "tiktok-perfil",
-        "handle": f"@{name}",
+        "handle": f"@{handle}",
         "nombre": nick,
-        "seguidores": first(author, "fans", "followerCount"),
-        "siguiendo": first(author, "following", "followingCount"),
-        "likes_totales": first(author, "heart", "heartCount"),
-        "videos_totales": first(author, "video", "videoCount"),
-        "verificado": author.get("verified"),
-        "url": f"https://www.tiktok.com/@{name}",
+        "seguidores": follower,
+        "videos_extraidos": len(profile_videos) + sum(len(v) for v in playlists.values()),
+        "url": f"https://www.tiktok.com/@{handle}",
         "extraido": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
     lines = ["---"]
@@ -282,104 +231,116 @@ def write_profile_note(out_dir, handle, author, ordered, groups):
         lines.append(f"{k}: {yaml_escape(v)}")
     lines.append("tags: [tiktok, archivo, perfil]")
     lines.append("---\n")
-    lines.append(f"# {nick} (@{name})\n")
-    bio = author.get("signature") or ""
-    if bio:
-        lines.append(f"> {bio}\n")
-
-    lines.append("## Resumen\n")
-    lines.append("| Métrica | Valor |")
-    lines.append("|---|---|")
-    lines.append(f"| Seguidores | {fm['seguidores']} |")
-    lines.append(f"| Siguiendo | {fm['siguiendo']} |")
-    lines.append(f"| Likes totales | {fm['likes_totales']} |")
-    lines.append(f"| Videos publicados | {fm['videos_totales']} |")
-    lines.append(f"| Videos extraídos | {len(ordered)} |")
-    lines.append(f"| Playlists | {len([g for g in groups if g != 'Videos'])} |\n")
+    lines.append(f"# {nick} (@{handle})\n")
 
     lines.append("## Videos (orden del perfil)\n")
-    for it in ordered:
-        pin = "📌 " if is_pinned(it) else ""
-        t = video_title(it)
-        lines.append(f"1. {pin}[[{slugify(t)}|{t}]]")
+    for info in profile_videos:
+        t = video_title(info)
+        lines.append(f"1. [[{slugify(t)}|{t}]]")
     lines.append("")
 
-    lines.append("## Playlists\n")
-    for label in sorted(groups):
-        if label == "Videos":
-            continue
-        lines.append(f"### {label}\n")
-        for it in groups[label]:
-            t = video_title(it)
-            lines.append(f"- [[{slugify(t)}|{t}]]")
-        lines.append("")
-    if "Videos" in groups:
-        lines.append("### (Sin playlist)\n")
-        for it in groups["Videos"]:
-            t = video_title(it)
-            lines.append(f"- [[{slugify(t)}|{t}]]")
-        lines.append("")
+    if playlists:
+        lines.append("## Playlists\n")
+        for label in sorted(playlists):
+            lines.append(f"### {label}\n")
+            for info in playlists[label]:
+                t = video_title(info)
+                lines.append(f"- [[{slugify(t)}|{t}]]")
+            lines.append("")
 
-    path = os.path.join(out_dir, f"@{name} - perfil.md")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(os.path.join(base, f"@{handle} - perfil.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    return name
 
 
 # ------------------------------- main -------------------------------------- #
 
+def parse_playlist_args(values):
+    playlists = {}
+    for v in values or []:
+        if "=" not in v:
+            sys.exit(f"--playlist debe ser 'Nombre=URL', recibí: {v}")
+        name, url = v.split("=", 1)
+        playlists[name.strip()] = url.strip()
+    return playlists
+
+
+def collect(ytdlp, url, limit):
+    """Corre yt-dlp en un tmpdir y devuelve (videos_ordenados, tmpdir)."""
+    tmpdir = tempfile.mkdtemp(prefix="ttdl_")
+    run_ytdlp(ytdlp, url, limit, tmpdir)
+    videos = load_videos(tmpdir)
+    videos.sort(key=video_ts, reverse=True)  # más reciente primero (orden del perfil)
+    return videos, tmpdir
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Extrae una cuenta pública de TikTok vía Apify a notas de Obsidian."
+        description="Archiva una cuenta pública de TikTok en Obsidian usando yt-dlp (gratis)."
     )
     parser.add_argument("handle", help="Usuario de TikTok (con o sin @).")
     parser.add_argument("-o", "--output", required=True, help="Carpeta destino (tu vault).")
     parser.add_argument("--limit", type=int, default=50, help="Máximo de videos (default 50).")
-    parser.add_argument("--actor", default=APIFY_ACTOR, help="Actor de Apify a usar.")
+    parser.add_argument(
+        "--playlist", action="append", metavar="Nombre=URL",
+        help="Playlist a separar (repetible). Copia la URL desde el perfil.",
+    )
+    parser.add_argument("--ytdlp", default="yt-dlp", help="Ruta al binario de yt-dlp.")
     args = parser.parse_args()
 
-    token = os.environ.get("APIFY_TOKEN")
-    if not token:
-        sys.exit("Falta APIFY_TOKEN. Exporta tu token: export APIFY_TOKEN='...'")
-
+    ensure_ytdlp(args.ytdlp)
     handle = args.handle.lstrip("@").strip()
+    playlists_urls = parse_playlist_args(args.playlist)
+
     base = os.path.join(args.output, f"TikTok - @{handle}")
     os.makedirs(base, exist_ok=True)
+    tmpdirs = []
+    sample = None
 
-    print(f"Extrayendo @{handle} (hasta {args.limit} videos, con subtítulos) vía Apify…")
-    items = fetch_from_apify(handle, token, args.limit, args.actor)
-    if not isinstance(items, list) or not items:
-        sys.exit("Apify no devolvió datos. Revisa el handle, tu token o el saldo de la cuenta.")
+    print(f"Archivando @{handle} con yt-dlp (hasta {args.limit} por fuente)…")
 
-    with open(os.path.join(base, "_raw.json"), "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    # 1) Perfil completo (orden cronológico).
+    profile_url = f"https://www.tiktok.com/@{handle}"
+    profile_videos, tmp = collect(args.ytdlp, profile_url, args.limit)
+    tmpdirs.append(tmp)
+    if not profile_videos:
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.exit(
+            "yt-dlp no devolvió videos. Verifica el handle, tu conexión, o actualiza yt-dlp\n"
+            "    python3 -m pip install -U yt-dlp"
+        )
+    sample = profile_videos[0]
 
-    videos = [it for it in items if isinstance(it, dict) and (it.get("id") or it.get("text"))]
-    author = author_from_items(videos)
-    ordered = profile_order(videos)
+    # 2) Playlists (cada una en su carpeta).
+    playlists = {}
+    playlist_tmp = {}
+    for name, url in playlists_urls.items():
+        vids, t = collect(args.ytdlp, url, args.limit)
+        tmpdirs.append(t)
+        playlists[name] = vids
+        playlist_tmp[name] = t
 
-    # Agrupa por playlist (en orden del perfil dentro de cada grupo).
-    groups = {}
-    for it in ordered:
-        label = playlist_name(it) or "Videos"
-        groups.setdefault(label, []).append(it)
+    # 3) Escribe notas.
+    write_profile_note(base, handle, sample, profile_videos, playlists)
 
-    name = write_profile_note(base, handle, author, ordered, groups)
+    videos_dir = os.path.join(base, "Videos")
+    os.makedirs(videos_dir, exist_ok=True)
+    for info in profile_videos:
+        note = os.path.join(videos_dir, f"{slugify(video_title(info))}.md")
+        write_video_note(note, handle, info, "Videos", tmp)
 
-    for label, vids in groups.items():
-        if label == "Videos":
-            folder = os.path.join(base, "Videos")
-        else:
-            folder = os.path.join(base, "Playlists", slugify(label))
+    for name, vids in playlists.items():
+        folder = os.path.join(base, "Playlists", slugify(name))
         os.makedirs(folder, exist_ok=True)
-        for it in vids:
-            note_path = os.path.join(folder, f"{slugify(video_title(it))}.md")
-            write_video_note(note_path, name, it, label)
+        for info in vids:
+            note = os.path.join(folder, f"{slugify(video_title(info))}.md")
+            write_video_note(note, handle, info, name, playlist_tmp[name])
 
-    n_pl = len([g for g in groups if g != "Videos"])
+    for t in tmpdirs:
+        shutil.rmtree(t, ignore_errors=True)
+
     print(
-        f"Listo. {len(videos)} videos en orden de perfil, {n_pl} playlists, "
-        f"transcripts incluidos.\nCarpeta: {base}"
+        f"Listo. {len(profile_videos)} videos del perfil, "
+        f"{len(playlists)} playlists, transcripts incluidos.\nCarpeta: {base}"
     )
 
 
